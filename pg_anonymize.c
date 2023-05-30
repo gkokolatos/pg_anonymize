@@ -48,6 +48,7 @@
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/seclabel.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -139,6 +140,8 @@ typedef struct pganWalkerContext
 /*---- Local variables ----*/
 
 bool pgan_toplevel = true;
+bool initial_executor_read_only = false; /* placate compiler */
+int	executor_nested_level = 0;
 
 /*---- GUC variables ----*/
 
@@ -152,6 +155,10 @@ void		_PG_init(void);
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static void pgan_post_parse_analyze(ParseState *pstate, Query *query
 #if PG_VERSION_NUM >= 140000
@@ -171,6 +178,13 @@ static void pgan_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								char *completionTag
 #endif
 								);
+static void pgan_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void pgan_ExecutorRun(QueryDesc *queryDesc,
+							 ScanDirection direction,
+							 uint64 count,
+							 bool execute_once);
+static void pgan_ExecutorFinish(QueryDesc *queryDesc);
+static void pgan_ExecutorEnd(QueryDesc *queryDesc);
 
 static void pgan_check_injection(Relation rel,
 								const ObjectAddress *object,
@@ -192,6 +206,7 @@ static bool pgan_is_role_anonymized(void);
 static void pgan_object_relabel(const ObjectAddress *object,
 							    const char *seclabel);
 
+static const char *GetCommandTypeName(CmdType commandType);
 
 void
 _PG_init(void)
@@ -266,6 +281,14 @@ _PG_init(void)
 	post_parse_analyze_hook = pgan_post_parse_analyze;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgan_ProcessUtility;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = pgan_ExecutorStart;
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = pgan_ExecutorRun;
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = pgan_ExecutorFinish;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = pgan_ExecutorEnd;
 }
 
 /*
@@ -813,6 +836,24 @@ pgan_hack_query(Node *node, void *context)
 				continue;
 
 			pgan_hack_rte(rte);
+
+			/*
+			 * In statements, for example
+			 * 		"INSERT INTO anonymized (a1, a2) SELECT * FROM non_anonymized"
+			 * rewriting the query into a subquery will generate an illegal
+			 * parsetree. This is because the target relation will be a subquery
+			 * instead of a plain relation.
+			 *
+			 * Fail early in the case that a modifying statement is recognized.
+			 */
+			if (rte->rtekind != RTE_RELATION &&
+				query->commandType != CMD_SELECT )
+			{
+				elog(ERROR,
+					 "%s command is not compatible with anonymized relation",
+					 GetCommandTypeName(query->commandType)
+					);
+			}
 		}
 
 		return query_tree_walker(query,
@@ -939,8 +980,6 @@ pgan_post_parse_analyze(ParseState *pstate, Query *query
 #endif
 		)
 {
-	/* XXX - should we try to prevent write queries ? */
-
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query
 #if PG_VERSION_NUM >= 140000
@@ -988,6 +1027,7 @@ pgan_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	CopyStmt *stmt;
 	char *sql;
 	bool prev_toplevel = pgan_toplevel;
+	bool prev_xact_read_only = XactReadOnly;
 	const char *newsql = queryString;
 
 	/* Module disabled, recursive call or not a COPY statement, bail out. */
@@ -1042,6 +1082,7 @@ pgan_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		 * Generate a query string corresponding to the statement we're now
 		 * really executing, and update all related field in the PlannedStmt.
 		 */
+		XactReadOnly = true;
 		initStringInfo(&copysql);
 		appendStringInfo(&copysql, "COPY (%s) TO ", sql);
 		if (stmt->filename != NULL)
@@ -1086,14 +1127,152 @@ hook:
 									);
 
 		pgan_toplevel = prev_toplevel;
+		XactReadOnly = prev_xact_read_only;
 	}
 	PG_CATCH();
 	{
 		pgan_toplevel = prev_toplevel;
+		XactReadOnly = prev_xact_read_only;
+
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 }
+
+/*
+ * ExecutorStart hook:
+ * 		When anonymization is enabled, detect if an anonymized relation is
+ * 		referenced. In such a case prevent any modifications for the whole
+ * 		transaction.
+ */
+static void
+pgan_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	/*
+	 * XXX: add a test case for it
+	 * It should not be a problem to set prev_xact_read_only in this step, even
+	 * when during nested executions, i.e. multiple calls to executorstart. If
+	 * the transaction fails during any step, it is rolledback so the
+	 * readonlyness is discarded along with the transaction state.
+	 *
+	 * XXX: test successfull execution of multiple nested transactions where the
+	 * readonlyness is changed within the deepest level.
+	 */
+	if (executor_nested_level == 0)
+		initial_executor_read_only = XactReadOnly;
+	executor_nested_level++;
+
+	if (pgan_enabled && pgan_is_role_anonymized())
+	{
+		List	   *rtable_list;
+		ListCell   *lc;
+
+		rtable_list = queryDesc->plannedstmt->rtable;
+		foreach(lc, rtable_list)
+		{
+			RangeTblEntry *rte = lfirst(lc);
+
+			if (rte->rtekind == RTE_RELATION)
+			{
+				Relation	rel;
+				char	  **seclabels;
+
+				rel = relation_open(rte->relid, AccessShareLock);
+
+				seclabels = pgan_get_rel_seclabels(rel);
+				if (seclabels)
+				{
+					XactReadOnly = true;
+					relation_close(rel, AccessShareLock);
+					break;
+				}
+
+				relation_close(rel, AccessShareLock);
+			}
+		}
+	}
+
+	PG_TRY();
+	{
+		if (prev_ExecutorStart)
+			prev_ExecutorStart(queryDesc, eflags);
+		else
+			standard_ExecutorStart(queryDesc, eflags);
+	}
+	PG_CATCH();
+	{
+		XactReadOnly = initial_executor_read_only;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * ExecutorRun hook: Reset the transaction's readonlyness to its initial state.
+ */
+static void
+pgan_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
+				 bool execute_once)
+{
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+		else
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+	}
+	PG_CATCH();
+	{
+		XactReadOnly = initial_executor_read_only;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * ExecutorFinish hook: Reset the transaction's readonlyness to its initial
+ * state.
+ */
+static void
+pgan_ExecutorFinish(QueryDesc *queryDesc)
+{
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_CATCH();
+	{
+		XactReadOnly = initial_executor_read_only;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * ExecutorEnd hook: Reset the transaction's readonlyness to its initial
+ * state.
+ */
+static void
+pgan_ExecutorEnd(QueryDesc *queryDesc)
+{
+	/*
+	 * It is very possible that this line is unecessary as PostgreSQL will reset
+	 * readonlyness to the initial state. Be a good citizen and reset the state
+	 * to it's initial case.
+	 */
+	executor_nested_level--;
+	if (executor_nested_level == 0)
+		XactReadOnly = initial_executor_read_only;
+
+	if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+}
+
 
 /*
  * Sanity checks on the user provided security labels.
@@ -1138,4 +1317,33 @@ pgan_object_relabel(const ObjectAddress *object, const char *seclabel)
 					get_rel_name(object->classId));
 			break;
 	}
+}
+
+/*
+ * Helper function to pretty print CmdType
+ */
+static const char *
+GetCommandTypeName(CmdType commandType)
+{
+	switch (commandType)
+	{
+		case CMD_UNKNOWN:
+			return "UNKNOWN";
+		case CMD_SELECT:
+			return "SELECT";
+		case CMD_UPDATE:
+			return "UPDATE";
+		case CMD_INSERT:
+			return "INSERT";
+		case CMD_DELETE:
+			return "DELETE";
+		case CMD_MERGE:
+			return "MERGE";
+		case CMD_UTILITY:
+			return "UTILITY";
+		case CMD_NOTHING:
+			return "NOTHING";
+	}
+
+	return NULL;	/* Unreached */
 }

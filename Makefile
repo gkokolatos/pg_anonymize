@@ -1,5 +1,5 @@
 EXTVERSION   = 0.0.1
-REGRESS      = 01_general 02_partitioning
+REGRESS      = 01_general 02_readonly 03_partitioning
 REGRESS_OPTS = --inputdir=test
 PGFILEDESC   = "pg_anonymize - perform data anonymization transparently on the database"
 
@@ -24,9 +24,9 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 ifneq ($(MAJORVERSION), 10)
-	REGRESS += 02_partitioning_hash
+	REGRESS += 03_partitioning_hash
 endif
 
-REGRESS += 03_inheritance \
+REGRESS += 04_inheritance \
 	   10_security \
 	   99_cleanup
